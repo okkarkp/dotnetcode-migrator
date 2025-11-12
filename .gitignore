@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Environment
+venv*/
+.env
+
+# Build outputs
+bin/
+obj/
+*.dll
+*.exe
+
+# AI Upgrade temp + reports
+/tmp/
+reports/
+*.bak
+*.diff
+
+# IDE
+.vscode/
+.idea/
