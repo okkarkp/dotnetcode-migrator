@@ -1,0 +1,16 @@
+[
+  {
+    "id": "PKG-DOTNET-001",
+    "pattern": "Swashbuckle.AspNetCore",
+    "issue": "6.x may be incompatible with new hosting/OpenAPI pipeline",
+    "recommendation": "Upgrade to >=7.0 or adopt Microsoft.AspNetCore.OpenApi",
+    "autofix": false
+  },
+  {
+    "id": "PKG-DOTNET-002",
+    "pattern": "Newtonsoft.Json",
+    "issue": "Older versions (<13.0) may lack fixes for newer runtime features",
+    "recommendation": "Upgrade to 13.0.2 or consider System.Text.Json",
+    "autofix": true
+  }
+]
