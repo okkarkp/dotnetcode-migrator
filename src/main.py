@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-# AI Upgrade Assistant v13 – with Layer 4 Verifier (Bullet-Proof)
+# AI Upgrade Assistant v14 – Multi-Project Mode + Verifier
 # ============================================================
 
 import re, json, sys, shutil, tempfile, subprocess, pathlib, itertools, datetime, traceback, os
@@ -9,7 +9,7 @@ from dynamic_rules import generate_dynamic_rules
 from code_scanner import scan_code_patterns
 from llm_client import query_llm
 from autofix_engine import run_autofix_pipeline, validate_build
-from verifier import verify_and_retry     # 👈 NEW
+from verifier import verify_and_retry     # Layer 4 recovery
 
 # ============================================================
 #  Argument Parsing (input/output + flags)
@@ -24,8 +24,6 @@ OUTPUT_PATH = pathlib.Path(next((a.split("=",1)[1] for a in args if a.startswith
                                 "/opt/oss-migrate/upgrade-poc/reports"))
 
 RULES  = pathlib.Path("/opt/oss-migrate/upgrade-poc/rules/dotnet_upgrade_rules.json")
-SAMPLE = INPUT_PATH / "DemoApp.csproj"
-REPORT = OUTPUT_PATH / "upgrade_summary.md"
 
 os.environ["UPGRADE_DRY_RUN"]   = "1" if DRY_RUN else "0"
 os.environ["UPGRADE_OUTPUT_DIR"] = str(OUTPUT_PATH)
@@ -33,6 +31,18 @@ os.environ["UPGRADE_OUTPUT_DIR"] = str(OUTPUT_PATH)
 print(f"🧱 Input: {INPUT_PATH}")
 print(f"📦 Output: {OUTPUT_PATH}")
 print(f"🧪 Flags: dry_run={DRY_RUN}, safe_mode={SAFE_MODE}")
+
+# ============================================================
+#  Detect all .csproj files
+# ============================================================
+
+csproj_files = list(INPUT_PATH.rglob("*.csproj"))
+if not csproj_files:
+    raise FileNotFoundError(f"No .csproj files found under {INPUT_PATH}")
+
+print(f"🧩 Found {len(csproj_files)} project(s):")
+for f in csproj_files:
+    print(f"   • {f}")
 
 # ============================================================
 #  Helper Functions
@@ -79,12 +89,12 @@ def run_runtime_test(tmp_proj_dir):
     except Exception as e:
         return False,str(e)
 
-def write_report(summary,project,diag,matched,dynamic_rules,
-                 code_patterns,outdated_json,fixes_applied,
-                 post_fix_success,post_fix_log,runtime_result=None):
-    OUTPUT_PATH.mkdir(parents=True,exist_ok=True)
-    with open(REPORT,"w") as f:
-        f.write("# AI Upgrade Summary (v13 with Verifier)\n\n")
+def write_report(report_path, summary, project, diag, matched, dynamic_rules,
+                 code_patterns, outdated_json, fixes_applied,
+                 post_fix_success, post_fix_log, runtime_result=None):
+    report_path.parent.mkdir(parents=True,exist_ok=True)
+    with open(report_path,"w") as f:
+        f.write("# AI Upgrade Summary (v14 Multi-Project + Verifier)\n\n")
         f.write("## Project Info\n```json\n"+json.dumps(project,indent=2)+"\n```\n\n")
         f.write("## AI-Generated Dynamic Rules\n```json\n"+json.dumps(dynamic_rules,indent=2)+"\n```\n\n")
         f.write("## Matched Static Rules\n```json\n"+json.dumps(matched,indent=2)+"\n```\n\n")
@@ -113,18 +123,19 @@ def safe_mode_rebuild(tmpdir,rules):
     return validate_build(tmpdir/"proj")
 
 # ============================================================
-#  Main Orchestrator
+#  Process each project
 # ============================================================
 
-def main():
-    if not SAMPLE.exists():
-        raise FileNotFoundError(f"Missing csproj at {SAMPLE}")
-    project=analyze_csproj(SAMPLE)
-    diag,tmpdir=retarget_and_build(SAMPLE,"net9.0")
-
+for SAMPLE in csproj_files:
     try:
+        print(f"\n🚀 Processing project: {SAMPLE.name}")
+        REPORT = OUTPUT_PATH / f"{SAMPLE.stem}_upgrade_summary.md"
+
+        project=analyze_csproj(SAMPLE)
+        diag,tmpdir=retarget_and_build(SAMPLE,"net9.0")
+
         # 1️⃣ Scan
-        code_patterns=scan_code_patterns(INPUT_PATH)
+        code_patterns=scan_code_patterns(SAMPLE.parent)
         print(f"🧩 Detected {len(code_patterns)} code patterns")
 
         # 2️⃣ Dynamic rules
@@ -183,24 +194,16 @@ POST-FIX STATUS: {"Success" if post_fix_success else "Failed"}
             summary="⚠️ No additional migration recommendations detected."
 
         # 9️⃣ Report
-        write_report(summary,project,diag,matched,dynamic_rules,
+        write_report(REPORT,summary,project,diag,matched,dynamic_rules,
                      code_patterns,outdated_json,fixes_applied,
                      post_fix_success,post_fix_log,runtime_result)
-        print(f"✅ Report generated: {REPORT}")
+        print(f"✅ Report generated for {SAMPLE.name}: {REPORT}")
+
+    except Exception as e:
+        crash=OUTPUT_PATH/f"crash_{SAMPLE.stem}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        with open(crash,"w") as f:
+            f.write(traceback.format_exc())
+        print(f"❌ Error processing {SAMPLE.name}: {e}\n📄 See {crash}")
 
     finally:
         shutil.rmtree(tmpdir,ignore_errors=True)
-
-# ============================================================
-#  Entrypoint + Exception Guard
-# ============================================================
-
-if __name__=="__main__":
-    try:
-        main()
-    except Exception as e:
-        crash=OUTPUT_PATH/f"crash_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        crash.parent.mkdir(parents=True,exist_ok=True)
-        with open(crash,"w") as f:
-            f.write(traceback.format_exc())
-        print(f"❌ Unexpected error: {e}\n📄 Trace written to {crash}")

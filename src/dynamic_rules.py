@@ -1,86 +1,74 @@
-import json, re
+#!/usr/bin/env python3
+# ============================================================
+# dynamic_rules.py – Enhanced AI Rule Generator (v3)
+# ============================================================
+
+import json, re, os
 from llm_client import query_llm
 
-JUNK_TOKENS = {"PackageName", "ClassName", "MethodName", "TypeName"}
+SAFE_AUTOFIX_KEYWORDS = [
+    "Newtonsoft.Json", "Swashbuckle", "SqlConnection",
+    "ConfigurationManager", "HttpContext", "System.Data.SqlClient"
+]
 
-def _looks_valid_pattern(p: str, code_patterns: list) -> bool:
-    if not p or any(t in p for t in JUNK_TOKENS):
-        return False
-    for keep in ("HttpContext", "ConfigurationManager", "SqlConnection",
-                 "System.Data.SqlClient", "Microsoft.Data.SqlClient"):
-        if keep in p:
-            return True
-    return any(p.strip("'\"") in cp for cp in code_patterns)
+def generate_dynamic_rules(project_json: str, diag: str, code_patterns: list):
+    """
+    Uses AI to infer dynamic migration rules from diagnostics and code patterns.
+    Returns a list of structured rule dicts.
+    """
 
-def validate_rule_schema(r):
-    required = {"id","pattern","issue","recommendation","autofix"}
-    return isinstance(r, dict) and required.issubset(r.keys()) and isinstance(r["pattern"], str)
-
-def generate_dynamic_rules(project_info: str, build_diag: str, code_patterns: list):
-    example = """[
-      {
-        "id": "AUTO-R000",
-        "pattern": "HttpContext.Current",
-        "issue": "Removed from ASP.NET Core",
-        "recommendation": "Use IHttpContextAccessor or remove HttpContext usage in console apps.",
-        "autofix": true
-      }
-    ]"""
+    # Expand context length for better understanding (up to 8k chars)
+    diag_excerpt = diag[:8000] if diag else ""
+    code_excerpt = json.dumps(code_patterns[:30], indent=2)
 
     prompt = f"""
-Return ONLY a JSON array of rules (no prose).
-Each rule: id, pattern, issue, recommendation, autofix.
-Prefer actionable API-level patterns found in the codebase.
+You are an expert .NET migration analyst.
+From the following build diagnostics and code patterns, infer practical migration rules.
+Each rule must have:
+- id (AUTO-R###)
+- pattern (string to match)
+- issue (plain text)
+- recommendation (clear fix)
+- autofix (true/false)
 
-Example format:
-{example}
+Focus on realistic upgrade issues (e.g., ConfigurationManager removed, HttpContext.Current, Newtonsoft.Json, SqlClient, etc.).
 
-PROJECT INFO:
-{project_info}
+PROJECT:
+{project_json}
 
-BUILD DIAGNOSTICS (trimmed):
-{build_diag[:1000]}
+DIAGNOSTICS (trimmed):
+{diag_excerpt}
 
-CODE PATTERNS (first 12):
-{json.dumps(code_patterns[:12], indent=2)}
+CODE PATTERNS:
+{code_excerpt}
 """
-    text = query_llm(prompt, max_tokens=800, temperature=0.25)
 
-    json_block = re.search(r"\[[\s\S]*\]", text)
-    parsed = []
-    if json_block:
-        try:
-            parsed = json.loads(json_block.group())
-        except Exception:
-            parsed = []
+    try:
+        response = query_llm(prompt, max_tokens=1200, temperature=0.25)
+        rules = json.loads(response) if response.strip().startswith("[") else []
+    except Exception:
+        rules = []
 
-    if not parsed:
-        parsed = [{
-            "id": "AUTO-R999",
-            "pattern": "ConfigurationManager.AppSettings",
-            "issue": "Legacy configuration API replaced in modern .NET",
-            "recommendation": "Use Microsoft.Extensions.Configuration with injected IConfiguration.",
-            "autofix": True
-        }]
+    # 🧩 Post-process: normalize & tag safe autofix rules
+    processed = []
+    for i, rule in enumerate(rules or []):
+        rid = rule.get("id") or f"AUTO-R{i:03}"
+        pattern = rule.get("pattern", "")
+        issue = rule.get("issue", "Unspecified issue")
+        recommendation = rule.get("recommendation", "Review manually.")
+        autofix = rule.get("autofix", False)
 
-    cleaned = []
-    for r in parsed:
-        if not validate_rule_schema(r):
-            continue
-        if not _looks_valid_pattern(r.get("pattern",""), code_patterns):
-            continue
-        r["autofix"] = True  # PoC: force on
-        cleaned.append(r)
-        if len(cleaned) >= 5:
-            break
+        # Mark safe autofix if pattern matches known library
+        if any(k.lower() in pattern.lower() for k in SAFE_AUTOFIX_KEYWORDS):
+            autofix = True
 
-    if not cleaned:
-        cleaned = [{
-            "id": "AUTO-R999",
-            "pattern": "ConfigurationManager.AppSettings",
-            "issue": "Legacy configuration API replaced in modern .NET",
-            "recommendation": "Use Microsoft.Extensions.Configuration with injected IConfiguration.",
-            "autofix": True
-        }]
+        processed.append({
+            "id": rid,
+            "pattern": pattern,
+            "issue": issue,
+            "recommendation": recommendation,
+            "autofix": autofix
+        })
 
-    return cleaned
+    print(f"🧠 Generated {len(processed)} dynamic rules")
+    return processed
