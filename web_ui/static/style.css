@@ -1,0 +1,24 @@
+body { margin:0; font-family:Arial; background:#fafafa; }
+.sidebar {
+    width:220px; background:#111; color:white; height:100vh;
+    position:fixed; padding:20px; box-sizing:border-box;
+}
+.sidebar h2 { margin-top:0; }
+.sidebar a {
+    color:#ddd; display:block; padding:10px 0; text-decoration:none;
+}
+.sidebar a.active, .sidebar a:hover { color:white; }
+
+.content {
+    margin-left:240px; padding:20px;
+}
+
+pre {
+    background:#000; color:#0f0; padding:15px;
+    height:70vh; overflow:auto; border-radius:5px;
+}
+
+table {
+    width:100%; border-collapse:collapse;
+}
+th, td { padding:8px; border-bottom:1px solid #ccc; }

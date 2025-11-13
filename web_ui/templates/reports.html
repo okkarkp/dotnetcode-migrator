@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upgrade Reports</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="sidebar">
+    <h2>AI Upgrade</h2>
+    <a href="/">Dashboard</a>
+    <a href="/rules">Learned Rules</a>
+    <a class="active" href="/reports">Reports</a>
+</div>
+
+<div class="content">
+    <h1>Upgrade Reports</h1>
+    <ul>
+    {% for r in reports %}
+        <li><a href="/reports/{{r}}">{{r}}</a></li>
+    {% endfor %}
+    </ul>
+</div>
+
+</body>
+</html>

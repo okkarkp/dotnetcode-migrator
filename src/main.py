@@ -1,209 +1,238 @@
 #!/usr/bin/env python3
-# ============================================================
-# AI Upgrade Assistant v14 – Multi-Project Mode + Verifier
-# ============================================================
+# AI Upgrade Orchestrator – Production v21 (Rule Decay + Project Type + Confidence)
 
-import re, json, sys, shutil, tempfile, subprocess, pathlib, itertools, datetime, traceback, os
+import re, json, sys, shutil, tempfile, pathlib, datetime, traceback, os
 from rule_loader import load_rules, match_rules
 from dynamic_rules import generate_dynamic_rules
 from code_scanner import scan_code_patterns
-from llm_client import query_llm
 from autofix_engine import run_autofix_pipeline, validate_build
-from verifier import verify_and_retry     # Layer 4 recovery
+from verifier import verify_and_retry
+from utils import run_cmd, list_csprojs, extract_error_codes, has_build_success
+from learning_db import log_rule_result
+from project_type import detect_project_type
+from llm_client import query_llm
 
-# ============================================================
-#  Argument Parsing (input/output + flags)
-# ============================================================
-
+# -------------------------------------------------------------------------
+# Arguments
+# -------------------------------------------------------------------------
 args = sys.argv[1:]
-DRY_RUN     = "--dry-run" in args
-SAFE_MODE   = "--safe-mode" in args
-INPUT_PATH  = pathlib.Path(next((a.split("=",1)[1] for a in args if a.startswith("--input=")),
-                                "/opt/oss-migrate/upgrade-poc/sample"))
-OUTPUT_PATH = pathlib.Path(next((a.split("=",1)[1] for a in args if a.startswith("--output=")),
-                                "/opt/oss-migrate/upgrade-poc/reports"))
 
-RULES  = pathlib.Path("/opt/oss-migrate/upgrade-poc/rules/dotnet_upgrade_rules.json")
+DRY_RUN   = "--dry-run" in args
+SAFE_MODE = "--safe-mode" in args
+INPUT     = pathlib.Path(next((a.split("=",1)[1] for a in args if a.startswith("--input=")), "."))
+OUTPUT    = pathlib.Path(next((a.split("=",1)[1] for a in args if a.startswith("--output=")), "./reports"))
+TARGET_TFM = next((a.split("=",1)[1] for a in args if a.startswith("--target=")), "net9.0")
 
-os.environ["UPGRADE_DRY_RUN"]   = "1" if DRY_RUN else "0"
-os.environ["UPGRADE_OUTPUT_DIR"] = str(OUTPUT_PATH)
-
-print(f"🧱 Input: {INPUT_PATH}")
-print(f"📦 Output: {OUTPUT_PATH}")
+print(f"🧱 Input: {INPUT}")
+print(f"📦 Output: {OUTPUT}")
+print(f"🎯 Target: {TARGET_TFM}")
 print(f"🧪 Flags: dry_run={DRY_RUN}, safe_mode={SAFE_MODE}")
 
-# ============================================================
-#  Detect all .csproj files
-# ============================================================
+OUTPUT.mkdir(parents=True, exist_ok=True)
 
-csproj_files = list(INPUT_PATH.rglob("*.csproj"))
+# -------------------------------------------------------------------------
+# Discover .csproj files
+# -------------------------------------------------------------------------
+csproj_files = list_csprojs(INPUT)
 if not csproj_files:
-    raise FileNotFoundError(f"No .csproj files found under {INPUT_PATH}")
+    raise FileNotFoundError(f"No .csproj files under {INPUT}")
 
 print(f"🧩 Found {len(csproj_files)} project(s):")
 for f in csproj_files:
     print(f"   • {f}")
 
-# ============================================================
-#  Helper Functions
-# ============================================================
+# -------------------------------------------------------------------------
+# Dependency ordering
+# -------------------------------------------------------------------------
+def sort_by_dependencies(files):
+    dep_map = {}
+    for proj in files:
+        txt = pathlib.Path(proj).read_text(errors="ignore")
+        refs = re.findall(r'<ProjectReference Include="(.*?)"', txt)
+        deps = [str((pathlib.Path(proj).parent / r).resolve()) for r in refs]
+        dep_map[str(proj)] = deps
 
-def run_cmd(cmd, cwd=None):
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
-    return (p.stdout or "") + (p.stderr or "")
+    order, seen = [], set()
 
+    def dfs(node):
+        if node in seen: return
+        for dep in dep_map.get(node, []):
+            if dep in dep_map:
+                dfs(dep)
+        seen.add(node)
+        order.append(node)
+
+    for f in map(str, files):
+        dfs(f)
+
+    return [pathlib.Path(p) for p in order if pathlib.Path(p) in files] or files
+
+# -------------------------------------------------------------------------
+# Analyze csproj
+# -------------------------------------------------------------------------
 def analyze_csproj(path):
-    text = pathlib.Path(path).read_text()
-    tfm = re.search(r"<TargetFramework>(.*?)</TargetFramework>", text)
-    pkgs = re.findall(r'PackageReference Include="(.*?)" Version="(.*?)"', text)
+    t = pathlib.Path(path).read_text()
+    tfm = re.search(r"<TargetFramework>(.*?)</TargetFramework>", t)
+    pkgs = re.findall(r'PackageReference Include="(.*?)" Version="(.*?)"', t)
     return {"targetFramework": tfm.group(1) if tfm else None, "packages": pkgs}
 
-def restore_project(csproj):
-    return run_cmd(["dotnet","restore",str(csproj)])
-
-def retarget_and_build(csproj_path, target_tfm="net9.0"):
+# -------------------------------------------------------------------------
+# Retarget + initial build
+# -------------------------------------------------------------------------
+def retarget_and_build(csproj_path, target_tfm=TARGET_TFM):
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="upgrade_poc_"))
     proj_dir = tmp / "proj"
     shutil.copytree(csproj_path.parent, proj_dir)
+
     f = proj_dir / csproj_path.name
-    t = f.read_text()
-    t = re.sub(r"<TargetFramework>.*?</TargetFramework>",
-               f"<TargetFramework>{target_tfm}</TargetFramework>", t)
-    f.write_text(t)
-    restore_project(f)
-    diag = run_cmd(["dotnet","build",str(f),"--nologo","-v","m"])
+    txt = f.read_text()
+    txt = re.sub(r"<TargetFramework>.*?</TargetFramework>",
+                 f"<TargetFramework>{target_tfm}</TargetFramework>", txt)
+    f.write_text(txt)
+
+    run_cmd(["dotnet","restore"], cwd=proj_dir)
+    diag = run_cmd(["dotnet","build","--nologo","-v","m"], cwd=proj_dir)
     return diag, tmp
 
+# -------------------------------------------------------------------------
+# Outdated scan
+# -------------------------------------------------------------------------
 def run_outdated_scan(csproj_path):
-    restore_project(csproj_path)
-    cmd = ["dotnet","list",str(csproj_path),
-           "package","--outdated","--include-transitive","--format","json"]
-    return run_cmd(cmd)
+    run_cmd(["dotnet","restore",str(csproj_path)])
+    return run_cmd(["dotnet","list",str(csproj_path),"package",
+                    "--outdated","--include-transitive","--format","json"])
 
-def run_runtime_test(tmp_proj_dir):
-    try:
-        r = subprocess.run(["dotnet","run","--no-build"],
-                           cwd=tmp_proj_dir,capture_output=True,text=True,timeout=10)
-        print("🧪 Runtime test executed.")
-        return r.returncode==0,(r.stdout or r.stderr)[:1000]
-    except Exception as e:
-        return False,str(e)
+# -------------------------------------------------------------------------
+# Write final report
+# -------------------------------------------------------------------------
+def write_report(report_path, summary_txt, project, diag, matched,
+                 dynamic_rules, patterns, outdated_json,
+                 fixes, post_ok, post_log, project_type):
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w") as f:
+        f.write("# Upgrade Report – Production v21\n\n")
+        f.write(f"## Target Framework: {TARGET_TFM}\n\n")
+        f.write(f"## Project Type: {project_type}\n\n")
 
-def write_report(report_path, summary, project, diag, matched, dynamic_rules,
-                 code_patterns, outdated_json, fixes_applied,
-                 post_fix_success, post_fix_log, runtime_result=None):
-    report_path.parent.mkdir(parents=True,exist_ok=True)
-    with open(report_path,"w") as f:
-        f.write("# AI Upgrade Summary (v14 Multi-Project + Verifier)\n\n")
-        f.write("## Project Info\n```json\n"+json.dumps(project,indent=2)+"\n```\n\n")
-        f.write("## AI-Generated Dynamic Rules\n```json\n"+json.dumps(dynamic_rules,indent=2)+"\n```\n\n")
-        f.write("## Matched Static Rules\n```json\n"+json.dumps(matched,indent=2)+"\n```\n\n")
-        f.write("## Code Patterns Detected\n```\n"+json.dumps(code_patterns,indent=2)+"\n```\n\n")
-        f.write("## Outdated Packages (NuGet)\n```\n"+outdated_json[:3000]+"\n```\n\n")
-        f.write("## Build Diagnostics (retargeted)\n```\n"+diag[:2000]+"\n```\n\n")
+        f.write("## Project Info\n```json\n")
+        f.write(json.dumps(project, indent=2))
+        f.write("\n```\n\n")
+
+        f.write("## Dynamic Rules (AI + Memory)\n```json\n")
+        f.write(json.dumps(dynamic_rules, indent=2))
+        f.write("\n```\n\n")
+
+        f.write("## Matched Static + Dynamic Rules\n```json\n")
+        f.write(json.dumps(matched, indent=2))
+        f.write("\n```\n\n")
+
+        f.write("## Code Patterns\n```json\n")
+        f.write(json.dumps(patterns, indent=2))
+        f.write("\n```\n\n")
+
+        f.write("## Outdated Packages\n```\n")
+        f.write((outdated_json or "")[:3000])
+        f.write("\n```\n\n")
+
+        f.write("## Initial Diagnostics\n```\n")
+        f.write((diag or "")[:2000])
+        f.write("\n```\n\n")
+
         f.write("## Autofix Results\n")
-        f.write(f"- Rules auto-fixed: {len(fixes_applied)} → {fixes_applied}\n")
-        f.write(f"- Post-fix build status: {'✅ Success' if post_fix_success else '❌ Failed'}\n\n")
-        f.write("### Post-fix Build Log (first 1200 chars)\n```\n"+(post_fix_log or '')[:1200]+"\n```\n\n")
-        if runtime_result:
-            ok,log = runtime_result
-            f.write("## Runtime Test\n")
-            f.write(f"Status: {'✅ Success' if ok else '⚠️ Failed'}\n")
-            f.write("```\n"+(log or '')[:1000]+"\n```\n\n")
-        f.write("## AI Recommendations\n"+summary+"\n")
+        f.write(f"- Rules auto-fixed: {len(fixes)} → {fixes}\n")
+        f.write(f"- Post-fix build: {'✅ SUCCESS' if post_ok else '❌ FAILED'}\n\n")
 
-def safe_mode_rebuild(tmpdir,rules):
-    print("🔁 Safe Mode: reverting AI edits & retrying structured fixes only…")
-    for file in pathlib.Path(tmpdir).rglob("*.bak"):
-        orig=str(file).replace(".bak","")
-        shutil.copyfile(file,orig)
-    pkg_rules=[r for r in rules if str(r.get("id","")).startswith("PKG-")]
-    from autofix_engine import run_autofix_pipeline,validate_build
-    run_autofix_pipeline(tmpdir/"proj",pkg_rules)
-    return validate_build(tmpdir/"proj")
+        f.write("### Post-Fix Build Log\n```\n")
+        f.write((post_log or "")[:2000])
+        f.write("\n```\n\n")
 
-# ============================================================
-#  Process each project
-# ============================================================
+        f.write("## AI Summary\n")
+        f.write(summary_txt)
+        f.write("\n")
 
-for SAMPLE in csproj_files:
+# -------------------------------------------------------------------------
+# Process each project
+# -------------------------------------------------------------------------
+for sample in sort_by_dependencies(csproj_files):
+    tmpdir = None
     try:
-        print(f"\n🚀 Processing project: {SAMPLE.name}")
-        REPORT = OUTPUT_PATH / f"{SAMPLE.stem}_upgrade_summary.md"
+        print(f"\n🚀 Processing project: {sample.name}")
+        REPORT = OUTPUT / f"{sample.stem}_upgrade_summary.md"
 
-        project=analyze_csproj(SAMPLE)
-        diag,tmpdir=retarget_and_build(SAMPLE,"net9.0")
+        # 1. Detect project type
+        project_type = detect_project_type(sample)
+        print(f"📌 Project Type: {project_type}")
 
-        # 1️⃣ Scan
-        code_patterns=scan_code_patterns(SAMPLE.parent)
-        print(f"🧩 Detected {len(code_patterns)} code patterns")
+        # 2. Analyze project
+        project = analyze_csproj(sample)
 
-        # 2️⃣ Dynamic rules
-        dynamic_rules=generate_dynamic_rules(json.dumps(project,indent=2),diag,code_patterns)
-        print(f"🧠 Generated {len(dynamic_rules)} dynamic rules")
+        # 3. Retarget + initial build
+        diag, tmpdir = retarget_and_build(sample, TARGET_TFM)
 
-        # 3️⃣ Static rules
-        static_rules=load_rules(RULES)
-        matched=match_rules(project["packages"],static_rules+dynamic_rules)
+        # 4. Code patterns
+        patterns = scan_code_patterns(sample.parent)
+        print(f"🧩 Code patterns found: {len(patterns)}")
 
-        # 4️⃣ Outdated packages
-        outdated_json=run_outdated_scan(SAMPLE)
+        # 5. AI + memory dynamic rules
+        dynamic_rules = generate_dynamic_rules(
+            json.dumps(project, indent=2),
+            diag,
+            patterns,
+            csproj_path=sample
+        )
+        print(f"🧠 Dynamic rules: {len(dynamic_rules)}")
 
-        # 5️⃣ Autofix
-        print("🚀 Starting autofix pipeline (Layer 2 + 3)…")
-        if DRY_RUN:
-            print("💡 Dry-run mode active — no writes.")
-        fixes_applied=run_autofix_pipeline(tmpdir/"proj",dynamic_rules)
-        print(f"🧩 Autofix completed for {len(fixes_applied)} rule(s).")
+        # 6. Static rules
+        static_rules = load_rules("/opt/oss-migrate/upgrade-poc/rules/dotnet_upgrade_rules.json")
+        matched = match_rules(project["packages"], static_rules + dynamic_rules)
 
-        # 6️⃣ Build validation (+ Verifier and Safe-Mode)
-        post_fix_success,post_fix_log=validate_build(tmpdir/"proj")
-        if not post_fix_success:
-            print("🧩 Invoking Layer 4 Verifier (post-fix recovery loop)…")
-            post_fix_success,post_fix_log=verify_and_retry(tmpdir/"proj")
-        if not post_fix_success and SAFE_MODE:
-            post_fix_success,post_fix_log=safe_mode_rebuild(tmpdir,dynamic_rules)
+        # 7. Outdated packages
+        outdated_json = run_outdated_scan(sample)
 
-        # 7️⃣ Optional runtime test
-        runtime_result=None
-        if post_fix_success:
-            runtime_result=run_runtime_test(tmpdir/"proj")
+        # 8. Autofix pipeline
+        print("🔧 Running autofix pipeline…")
+        fixes = run_autofix_pipeline(tmpdir/"proj", dynamic_rules)
 
-        # 8️⃣ AI summary
-        merged=(diag or '')+"\n"+(post_fix_log or '')
-        sentences=re.split(r"(?<=[.!?])\s+",merged)
-        unique=list(dict.fromkeys(s.strip() for s in sentences if len(s.strip())>5))
-        compressed=" ".join(itertools.islice(unique,0,40))
-        summary_prompt=f"""
-You are a .NET migration analyst.
-Summarize upgrade actions, applied fixes and remaining issues (once only).
+        # 9. Post fix build
+        post_ok, post_log = validate_build(tmpdir/"proj")
+        if not post_ok:
+            print("🔍 Running verifier…")
+            post_ok, post_log = verify_and_retry(tmpdir/"proj")
 
-PROJECT INFO:
-{json.dumps(project,indent=2)}
+        # 10. Log-learning to SQLite
+        for r in dynamic_rules:
+            log_rule_result(
+                r.get("id"),
+                r.get("pattern"),
+                r.get("recommendation"),
+                sample.stem,
+                extract_error_codes(post_log),
+                post_ok,
+                r.get("confidence", 1.0)
+            )
 
-RULES (static + dynamic):
-{json.dumps(matched+dynamic_rules,indent=2)}
+        # 11. AI summary
+        combined = (diag or "") + "\n" + (post_log or "")
+        summary = query_llm(
+            f"Summarize migration actions and issues:\n{combined[:4000]}",
+            max_tokens=450, temperature=0.2
+        ) or "—"
 
-DEDUPED DIAGNOSTICS (trimmed):
-{compressed}
+        # 12. Report
+        write_report(
+            REPORT, summary, project, diag, matched,
+            dynamic_rules, patterns, outdated_json,
+            fixes, post_ok, post_log, project_type
+        )
 
-POST-FIX STATUS: {"Success" if post_fix_success else "Failed"}
-"""
-        summary=query_llm(summary_prompt,max_tokens=800,temperature=0.25)
-        if not summary.strip():
-            summary="⚠️ No additional migration recommendations detected."
-
-        # 9️⃣ Report
-        write_report(REPORT,summary,project,diag,matched,dynamic_rules,
-                     code_patterns,outdated_json,fixes_applied,
-                     post_fix_success,post_fix_log,runtime_result)
-        print(f"✅ Report generated for {SAMPLE.name}: {REPORT}")
+        print(f"✅ Done: {REPORT}")
 
     except Exception as e:
-        crash=OUTPUT_PATH/f"crash_{SAMPLE.stem}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        with open(crash,"w") as f:
+        crash = OUTPUT / f"crash_{sample.stem}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        with open(crash, "w") as f:
             f.write(traceback.format_exc())
-        print(f"❌ Error processing {SAMPLE.name}: {e}\n📄 See {crash}")
+        print(f"❌ Error: {e}\n📄 Crash log saved: {crash}")
 
     finally:
-        shutil.rmtree(tmpdir,ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
